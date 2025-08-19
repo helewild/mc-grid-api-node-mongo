@@ -1,4 +1,4 @@
-// server.cjs (CommonJS, robust)
+// server.cjs (CommonJS, robust signature handling)
 const express = require('express');
 const dotenv = require('dotenv');
 const crypto = require('crypto');
@@ -21,9 +21,8 @@ app.get('/health', (req, res) => res.type('text/plain').send('OK'));
 // Helpers
 const sha1 = (s) => crypto.createHash('sha1').update(s).digest('hex');
 
-// Ultra-tolerant signature verifier (accepts string/object bodies)
+// Ultra-tolerant signature verifier
 function verifySig(req, res, next) {
-  // If entire body arrived as a string, try to parse it
   if (typeof req.body === 'string') {
     try { req.body = JSON.parse(req.body); } catch { /* ignore */ }
   }
@@ -31,7 +30,6 @@ function verifySig(req, res, next) {
   let payload = req.body && req.body.payload;
   let sig     = req.body && req.body.sig;
 
-  // If payload is an object, canonicalize it
   if (payload && typeof payload === 'object') {
     try { payload = JSON.stringify(payload); } catch {}
   }
@@ -40,34 +38,46 @@ function verifySig(req, res, next) {
     return res.status(400).type('text/plain').send('Bad payload');
   }
 
-  payload = payload.trim();
-  sig = sig.trim().toLowerCase();
+  const sigLower = sig.trim().toLowerCase();
 
-  // Raw string match
+  // 1) Raw check (no trim on payload)
   const expectRaw = sha1(SECRET + '|' + payload).toLowerCase();
-  if (expectRaw === sig) {
-    try { req.data = JSON.parse(payload); } catch { return res.status(400).type('text/plain').send('Bad JSON'); }
+  if (expectRaw === sigLower) {
+    try { req.data = JSON.parse(payload); } catch {
+      return res.status(400).type('text/plain').send('Bad JSON');
+    }
     return next();
   }
 
-  // Canonical JSON match
+  // 2) Canonical JSON check
   try {
     const obj = JSON.parse(payload);
     const stable = JSON.stringify(obj);
     const expectStable = sha1(SECRET + '|' + stable).toLowerCase();
-    if (expectStable === sig) {
+    if (expectStable === sigLower) {
       req.data = obj;
       return next();
     }
-  } catch {}
+    console.warn('[sig-mismatch]', {
+      recvSig: sigLower.slice(0,8),
+      rawSig: expectRaw.slice(0,8),
+      stableSig: expectStable.slice(0,8),
+      payloadLen: payload.length
+    });
+  } catch {
+    console.warn('[sig-mismatch]', {
+      recvSig: sigLower.slice(0,8),
+      rawSig: expectRaw.slice(0,8),
+      payloadLen: payload.length
+    });
+  }
 
-  console.warn('[sig-mismatch]', { recvSig: sig.slice(0,8), rawSig: expectRaw.slice(0,8), payloadLen: payload.length });
   return res.status(401).type('text/plain').send('Bad sig');
 }
 
 const nanoid = customAlphabet('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz', 10);
 
-// Start everything in an async IIFE (no top-level await)
+// Async startup wrapper
 (async () => {
   try {
     if (!MONGO_URI) {
@@ -84,7 +94,7 @@ const nanoid = customAlphabet('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklm
     await db.collection('members').createIndex({ avatar_id: 1 }, { unique: true });
     await db.collection('turf').createIndex({ beacon_id: 1 }, { unique: true });
 
-    // ---------- Routes ----------
+    // ------------------ Routes ------------------
 
     // Register HUD (signed)
     app.post('/v1/hud/register', verifySig, async (req, res) => {
@@ -125,7 +135,11 @@ const nanoid = customAlphabet('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklm
       const { name, tag, founder_id } = req.data;
       const club_id = nanoid();
       await db.collection('clubs').insertOne({
-        club_id, name: name || 'Club', tag: tag || 'MC', founder_id: founder_id || '', created_at: Date.now()
+        club_id,
+        name: name || 'Club',
+        tag: tag || 'MC',
+        founder_id: founder_id || '',
+        created_at: Date.now()
       });
       await db.collection('members').updateOne(
         { avatar_id: founder_id },
@@ -166,6 +180,7 @@ const nanoid = customAlphabet('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklm
       res.json(rows);
     });
 
+    // Start server
     app.listen(PORT, () => console.log('✅ API (Node + Mongo) running on :' + PORT));
   } catch (err) {
     console.error('❌ Startup error:', err);
