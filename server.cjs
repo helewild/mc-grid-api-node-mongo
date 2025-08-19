@@ -1,23 +1,18 @@
 // server.cjs
-// A tiny Express API that verifies a short HMAC-style signature from your SL HUD.
-// Signature rule (to keep LSL-friendly):
+// Minimal Express API that verifies a short HMAC-style signature from your SL HUD.
+// Signature rule (LSL-friendly):
 //   sig = first 8 hex chars of SHA1( SECRET + "|" + rawJsonBody )
-// Both sides must use *identical* raw JSON (no extra spaces) to match the hash.
 
 const express = require('express');
 const crypto = require('crypto');
 const cors = require('cors');
 
-// ---- Config ----
 const PORT = process.env.PORT || 3000;
-// MUST match the HUD's CHANGEME_SECRET in LSL:
+// MUST match the HUD's SECRET in LSL:
 const SHARED_SECRET = process.env.SHARED_SECRET || 'CHANGEME_SECRET';
 
-// ---- App ----
+// Capture raw body string to hash exactly as sent by the HUD.
 const app = express();
-
-// We need the raw body string (not parsed/pretty-printed) to hash exactly.
-// So, capture raw buffers and also parse JSON afterwards.
 app.use(
   express.json({
     verify: (req, _res, buf) => {
@@ -34,19 +29,15 @@ app.use(
   })
 );
 
-// util: compute first 8 of sha1(secret + "|" + rawJson)
+// Compute first 8 hex chars of sha1(secret + "|" + rawJson)
 function computeSig(secret, raw) {
   const h = crypto.createHash('sha1');
   h.update(secret + '|' + raw, 'utf8');
   return h.digest('hex').slice(0, 8);
 }
 
-// Simple health
-app.get('/', (_req, res) => {
-  res.type('text/plain').send('OK');
-});
+app.get('/', (_req, res) => res.type('text/plain').send('OK'));
 
-// Registration endpoint the HUD will call
 app.post('/api/register', (req, res) => {
   try {
     const raw = req.rawBody || '';
@@ -65,9 +56,7 @@ app.post('/api/register', (req, res) => {
       });
     }
 
-    // At this point, the signature matched — trust the body.
     const data = req.body || {};
-    // You can store/lookup avatars, issue tokens, etc. Here we just echo back.
     return res.json({
       ok: true,
       message: 'Registered',
