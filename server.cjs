@@ -1,4 +1,4 @@
-// server.js (CommonJS)
+// server.cjs (CommonJS, robust)
 const express = require('express');
 const dotenv = require('dotenv');
 const crypto = require('crypto');
@@ -15,13 +15,13 @@ const MONGO_DB  = process.env.MONGO_DB || 'mcgrid';
 const app = express();
 app.use(express.json({ limit: '256kb' }));
 
-// Simple health check
+// Health check
 app.get('/health', (req, res) => res.type('text/plain').send('OK'));
 
 // Helpers
 const sha1 = (s) => crypto.createHash('sha1').update(s).digest('hex');
 
-// Ultra-tolerant signature verifier
+// Ultra-tolerant signature verifier (accepts string/object bodies)
 function verifySig(req, res, next) {
   // If entire body arrived as a string, try to parse it
   if (typeof req.body === 'string') {
@@ -43,7 +43,7 @@ function verifySig(req, res, next) {
   payload = payload.trim();
   sig = sig.trim().toLowerCase();
 
-  // Raw-string match
+  // Raw string match
   const expectRaw = sha1(SECRET + '|' + payload).toLowerCase();
   if (expectRaw === sig) {
     try { req.data = JSON.parse(payload); } catch { return res.status(400).type('text/plain').send('Bad JSON'); }
@@ -67,7 +67,7 @@ function verifySig(req, res, next) {
 
 const nanoid = customAlphabet('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz', 10);
 
-// Start everything in an async IIFE to avoid top-level await
+// Start everything in an async IIFE (no top-level await)
 (async () => {
   try {
     if (!MONGO_URI) {
