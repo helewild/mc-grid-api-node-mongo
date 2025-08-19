@@ -1,4 +1,4 @@
-// server.cjs (CommonJS, robust signature handling)
+// server.cjs (CommonJS, robust signature handling + compat variants)
 const express = require('express');
 const dotenv = require('dotenv');
 const crypto = require('crypto');
@@ -21,15 +21,17 @@ app.get('/health', (req, res) => res.type('text/plain').send('OK'));
 // Helpers
 const sha1 = (s) => crypto.createHash('sha1').update(s).digest('hex');
 
-// Ultra-tolerant signature verifier
+// Ultra-tolerant signature verifier with compat variants + diagnostics
 function verifySig(req, res, next) {
+  // If the whole body arrived as a string, try to parse it
   if (typeof req.body === 'string') {
-    try { req.body = JSON.parse(req.body); } catch { /* ignore */ }
+    try { req.body = JSON.parse(req.body); } catch { /* keep as string */ }
   }
 
   let payload = req.body && req.body.payload;
   let sig     = req.body && req.body.sig;
 
+  // If payload is an object, canonicalize it to a string
   if (payload && typeof payload === 'object') {
     try { payload = JSON.stringify(payload); } catch {}
   }
@@ -40,44 +42,53 @@ function verifySig(req, res, next) {
 
   const sigLower = sig.trim().toLowerCase();
 
-  // 1) Raw check (no trim on payload)
-  const expectRaw = sha1(SECRET + '|' + payload).toLowerCase();
-  if (expectRaw === sigLower) {
-    try { req.data = JSON.parse(payload); } catch {
-      return res.status(400).type('text/plain').send('Bad JSON');
-    }
-    return next();
-  }
+  // Build candidate payload variants to hash
+  const candidates = [];
+  // 1) RAW (exact) — do NOT trim/modify
+  candidates.push(payload);
+  // 2) Canonical JSON (parse + stringify)
+  try { candidates.push(JSON.stringify(JSON.parse(payload))); } catch {}
 
-  // 2) Canonical JSON check
-  try {
-    const obj = JSON.parse(payload);
-    const stable = JSON.stringify(obj);
-    const expectStable = sha1(SECRET + '|' + stable).toLowerCase();
-    if (expectStable === sigLower) {
-      req.data = obj;
+  // 3) Common wire-format quirks (harmless to try)
+  // a) \/ vs /
+  candidates.push(payload.replace(/\\\//g, '/'));
+  // b) line-ending normalization
+  candidates.push(payload.replace(/\r\n/g, '\n'));
+  candidates.push(payload.replace(/\n/g, '\r\n'));
+  // c) trailing newline variants
+  candidates.push(payload + '\n');
+  candidates.push(payload + '\r\n');
+
+  // Try each candidate
+  for (const cand of candidates) {
+    if (typeof cand !== 'string') continue;
+    const h = sha1(SECRET + '|' + cand).toLowerCase();
+    if (h === sigLower) {
+      // Success: parse data from the matching candidate
+      try { req.data = JSON.parse(cand); }
+      catch { return res.status(400).type('text/plain').send('Bad JSON'); }
       return next();
     }
-    console.warn('[sig-mismatch]', {
-      recvSig: sigLower.slice(0,8),
-      rawSig: expectRaw.slice(0,8),
-      stableSig: expectStable.slice(0,8),
-      payloadLen: payload.length
-    });
-  } catch {
-    console.warn('[sig-mismatch]', {
-      recvSig: sigLower.slice(0,8),
-      rawSig: expectRaw.slice(0,8),
-      payloadLen: payload.length
-    });
   }
+
+  // If none matched, log short diagnostics (safe—does not expose secret)
+  const rawSig = sha1(SECRET + '|' + payload).toLowerCase();
+  let stableSig = '';
+  try { stableSig = sha1(SECRET + '|' + JSON.stringify(JSON.parse(payload))).toLowerCase(); } catch {}
+  console.warn('[sig-mismatch]', {
+    recvSig: sigLower.slice(0,8),
+    rawSig: rawSig.slice(0,8),
+    stableSig: stableSig.slice(0,8),
+    payloadLen: payload.length,
+    payloadFirst80: payload.slice(0,80)
+  });
 
   return res.status(401).type('text/plain').send('Bad sig');
 }
 
 const nanoid = customAlphabet('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz', 10);
 
-// Async startup wrapper
+// Async startup wrapper (no top-level await)
 (async () => {
   try {
     if (!MONGO_URI) {
@@ -89,7 +100,7 @@ const nanoid = customAlphabet('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklm
     await client.connect();
     const db = client.db(MONGO_DB);
 
-    // Indexes
+    // Helpful indexes
     await db.collection('huds').createIndex({ avatar_id: 1 }, { unique: true });
     await db.collection('members').createIndex({ avatar_id: 1 }, { unique: true });
     await db.collection('turf').createIndex({ beacon_id: 1 }, { unique: true });
@@ -165,7 +176,12 @@ const nanoid = customAlphabet('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklm
       const { beacon_id, parcel, club_id, score } = req.data;
       await db.collection('turf').updateOne(
         { beacon_id },
-        { $set: { parcel: parcel || '', club_id: club_id || '', score: parseInt(score || 0, 10), updated_at: Date.now() } },
+        { $set: {
+            parcel: parcel || '',
+            club_id: club_id || '',
+            score: parseInt(score || 0, 10),
+            updated_at: Date.now()
+          } },
         { upsert: true }
       );
       res.type('text/plain').send('OK');
