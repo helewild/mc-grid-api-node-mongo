@@ -2,7 +2,7 @@
   "name": "mc-grid-api-node-mongo",
   "version": "1.0.0",
   "description": "Second Life MC grid-wide API (Node.js + Express + MongoDB)",
-  "main": "server.js",
+  "main": "server.cjs",
   "scripts": {
     "start": "node server.cjs"
   },
@@ -14,4 +14,3 @@
   },
   "engines": { "node": ">=18" }
 }
-
