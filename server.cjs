@@ -1,205 +1,91 @@
-// server.cjs (CommonJS, robust signature handling + compat variants)
+// server.cjs
+// A tiny Express API that verifies a short HMAC-style signature from your SL HUD.
+// Signature rule (to keep LSL-friendly):
+//   sig = first 8 hex chars of SHA1( SECRET + "|" + rawJsonBody )
+// Both sides must use *identical* raw JSON (no extra spaces) to match the hash.
+
 const express = require('express');
-const dotenv = require('dotenv');
 const crypto = require('crypto');
-const { MongoClient } = require('mongodb');
-const { customAlphabet } = require('nanoid');
+const cors = require('cors');
 
-dotenv.config();
+// ---- Config ----
+const PORT = process.env.PORT || 3000;
+// MUST match the HUD's CHANGEME_SECRET in LSL:
+const SHARED_SECRET = process.env.SHARED_SECRET || 'CHANGEME_SECRET';
 
-const SECRET    = process.env.SECRET || 'CHANGEME_SECRET';
-const PORT      = process.env.PORT || 8080;
-const MONGO_URI = process.env.MONGO_URI;
-const MONGO_DB  = process.env.MONGO_DB || 'mcgrid';
-
+// ---- App ----
 const app = express();
-app.use(express.json({ limit: '256kb' }));
 
-// Health check
-app.get('/health', (req, res) => res.type('text/plain').send('OK'));
+// We need the raw body string (not parsed/pretty-printed) to hash exactly.
+// So, capture raw buffers and also parse JSON afterwards.
+app.use(
+  express.json({
+    verify: (req, _res, buf) => {
+      req.rawBody = buf.toString('utf8');
+    },
+  })
+);
 
-// Helpers
-const sha1 = (s) => crypto.createHash('sha1').update(s).digest('hex');
+app.use(
+  cors({
+    origin: true,
+    methods: ['POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'X-Sig'],
+  })
+);
 
-// Ultra-tolerant signature verifier with compat variants + diagnostics
-function verifySig(req, res, next) {
-  // If the whole body arrived as a string, try to parse it
-  if (typeof req.body === 'string') {
-    try { req.body = JSON.parse(req.body); } catch { /* keep as string */ }
-  }
-
-  let payload = req.body && req.body.payload;
-  let sig     = req.body && req.body.sig;
-
-  // If payload is an object, canonicalize it to a string
-  if (payload && typeof payload === 'object') {
-    try { payload = JSON.stringify(payload); } catch {}
-  }
-
-  if (typeof payload !== 'string' || typeof sig !== 'string') {
-    return res.status(400).type('text/plain').send('Bad payload');
-  }
-
-  const sigLower = sig.trim().toLowerCase();
-
-  // Build candidate payload variants to hash
-  const candidates = [];
-  // 1) RAW (exact) — do NOT trim/modify
-  candidates.push(payload);
-  // 2) Canonical JSON (parse + stringify)
-  try { candidates.push(JSON.stringify(JSON.parse(payload))); } catch {}
-
-  // 3) Common wire-format quirks (harmless to try)
-  // a) \/ vs /
-  candidates.push(payload.replace(/\\\//g, '/'));
-  // b) line-ending normalization
-  candidates.push(payload.replace(/\r\n/g, '\n'));
-  candidates.push(payload.replace(/\n/g, '\r\n'));
-  // c) trailing newline variants
-  candidates.push(payload + '\n');
-  candidates.push(payload + '\r\n');
-
-  // Try each candidate
-  for (const cand of candidates) {
-    if (typeof cand !== 'string') continue;
-    const h = sha1(SECRET + '|' + cand).toLowerCase();
-    if (h === sigLower) {
-      // Success: parse data from the matching candidate
-      try { req.data = JSON.parse(cand); }
-      catch { return res.status(400).type('text/plain').send('Bad JSON'); }
-      return next();
-    }
-  }
-
-  // If none matched, log short diagnostics (safe—does not expose secret)
-  const rawSig = sha1(SECRET + '|' + payload).toLowerCase();
-  let stableSig = '';
-  try { stableSig = sha1(SECRET + '|' + JSON.stringify(JSON.parse(payload))).toLowerCase(); } catch {}
-  console.warn('[sig-mismatch]', {
-    recvSig: sigLower.slice(0,8),
-    rawSig: rawSig.slice(0,8),
-    stableSig: stableSig.slice(0,8),
-    payloadLen: payload.length,
-    payloadFirst80: payload.slice(0,80)
-  });
-
-  return res.status(401).type('text/plain').send('Bad sig');
+// util: compute first 8 of sha1(secret + "|" + rawJson)
+function computeSig(secret, raw) {
+  const h = crypto.createHash('sha1');
+  h.update(secret + '|' + raw, 'utf8');
+  return h.digest('hex').slice(0, 8);
 }
 
-const nanoid = customAlphabet('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz', 10);
+// Simple health
+app.get('/', (_req, res) => {
+  res.type('text/plain').send('OK');
+});
 
-// Async startup wrapper (no top-level await)
-(async () => {
+// Registration endpoint the HUD will call
+app.post('/api/register', (req, res) => {
   try {
-    if (!MONGO_URI) {
-      console.error('❌ Missing MONGO_URI env var');
-      process.exit(1);
+    const raw = req.rawBody || '';
+    const gotSig = (req.get('X-Sig') || '').trim().toLowerCase();
+    const wantSig = computeSig(SHARED_SECRET, raw);
+
+    if (!gotSig) {
+      return res.status(400).json({ ok: false, error: 'Missing X-Sig header' });
+    }
+    if (gotSig !== wantSig) {
+      return res.status(401).json({
+        ok: false,
+        error: 'Bad sig',
+        recvSig: gotSig,
+        expected: wantSig,
+      });
     }
 
-    const client = new MongoClient(MONGO_URI);
-    await client.connect();
-    const db = client.db(MONGO_DB);
-
-    // Helpful indexes
-    await db.collection('huds').createIndex({ avatar_id: 1 }, { unique: true });
-    await db.collection('members').createIndex({ avatar_id: 1 }, { unique: true });
-    await db.collection('turf').createIndex({ beacon_id: 1 }, { unique: true });
-
-    // ------------------ Routes ------------------
-
-    // Register HUD (signed)
-    app.post('/v1/hud/register', verifySig, async (req, res) => {
-      const { avatar_id, avatar_name, url } = req.data;
-      await db.collection('huds').updateOne(
-        { avatar_id },
-        { $set: { avatar_name: avatar_name || '', url: url || '', updated_at: Date.now() } },
-        { upsert: true }
-      );
-      res.type('text/plain').send('OK');
+    // At this point, the signature matched — trust the body.
+    const data = req.body || {};
+    // You can store/lookup avatars, issue tokens, etc. Here we just echo back.
+    return res.json({
+      ok: true,
+      message: 'Registered',
+      echo: {
+        avatar_id: data.avatar_id,
+        avatar_name: data.avatar_name,
+        hud_version: data.hud_version,
+        region: data.region,
+        timestamp: data.timestamp,
+      },
     });
-
-    // HUD heartbeat (signed)
-    app.post('/v1/hud/heartbeat', verifySig, async (req, res) => {
-      const { avatar_id } = req.data;
-      await db.collection('huds').updateOne(
-        { avatar_id },
-        { $set: { updated_at: Date.now() } }
-      );
-      res.type('text/plain').send('OK');
-    });
-
-    // List HUD endpoints (auth via header or ?key=)
-    app.get('/v1/hud/endpoints', async (req, res) => {
-      const key = req.get('x-auth') || req.get('X-Auth') || (req.query && req.query.key);
-      if (key !== SECRET) return res.status(401).type('text/plain').send('No');
-
-      const huds = await db.collection('huds')
-        .find({ url: { $exists: true, $ne: '' } })
-        .project({ _id: 0, avatar_id: 1, url: 1 })
-        .toArray();
-
-      res.type('text/plain').send(huds.map(h => `${h.avatar_id},${h.url}`).join('\n'));
-    });
-
-    // Create club (signed)
-    app.post('/v1/club/create', verifySig, async (req, res) => {
-      const { name, tag, founder_id } = req.data;
-      const club_id = nanoid();
-      await db.collection('clubs').insertOne({
-        club_id,
-        name: name || 'Club',
-        tag: tag || 'MC',
-        founder_id: founder_id || '',
-        created_at: Date.now()
-      });
-      await db.collection('members').updateOne(
-        { avatar_id: founder_id },
-        { $set: { club_id, rank: 'Prez' } },
-        { upsert: true }
-      );
-      res.json({ club_id });
-    });
-
-    // Set member (signed)
-    app.post('/v1/member/set', verifySig, async (req, res) => {
-      const { avatar_id, club_id, rank } = req.data;
-      await db.collection('members').updateOne(
-        { avatar_id },
-        { $set: { club_id, rank: rank || 'Member' } },
-        { upsert: true }
-      );
-      res.type('text/plain').send('OK');
-    });
-
-    // Update turf (signed)
-    app.post('/v1/turf/update', verifySig, async (req, res) => {
-      const { beacon_id, parcel, club_id, score } = req.data;
-      await db.collection('turf').updateOne(
-        { beacon_id },
-        { $set: {
-            parcel: parcel || '',
-            club_id: club_id || '',
-            score: parseInt(score || 0, 10),
-            updated_at: Date.now()
-          } },
-        { upsert: true }
-      );
-      res.type('text/plain').send('OK');
-    });
-
-    // Turf summary (public)
-    app.get('/v1/turf/summary', async (req, res) => {
-      const rows = await db.collection('turf')
-        .find({}, { projection: { _id: 0 } })
-        .sort({ updated_at: -1 })
-        .toArray();
-      res.json(rows);
-    });
-
-    // Start server
-    app.listen(PORT, () => console.log('✅ API (Node + Mongo) running on :' + PORT));
-  } catch (err) {
-    console.error('❌ Startup error:', err);
-    process.exit(1);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, error: 'Server error' });
   }
-})();
+});
+
+app.listen(PORT, () => {
+  console.log(`HUD API listening on http://0.0.0.0:${PORT}`);
+  console.log(`Secret: ${SHARED_SECRET}`);
+});
